@@ -1,7 +1,5 @@
 #include <AES.h>
-//#include <AESGCM.h>
 #include <Arduino.h>
-//#include <arduinoFFT.h>
 #include <Audio.h>
 #include <Crypto.h>
 #include <driver/i2s.h>
@@ -12,9 +10,10 @@
 #include <stdint.h>
 
 
-#define SAMPLE_RATE 24000
+// Universal Sample Rate
+#define SAMPLE_RATE 16000
 
-// Connections to INMP441 I2S microphone
+//INMP441
 #define I2S_WS 4
 #define I2S_SD 35
 #define I2S_SCK 19
@@ -31,17 +30,11 @@
 #define I2S_PORT_IN I2S_NUM_0
 #define I2S_PORT_OUT I2S_NUM_1
 
-//#define AUDIO_SAMPLE_RATE     16000//8000  // 44100 init 8000//24000 best
-#define AUDIO_OPUS_FRAME_MS   100   // one of 2.5, 5, 10, 20, 40, 60, 80, 100, 120 init 40 //100 best
-#define AUDIO_OPUS_BITRATE    16000// bit rate from 2400 to 512000 //16000 best
+// Compression Parameters
+#define AUDIO_OPUS_FRAME_MS   20   // one of 2.5, 5, 10, 20, 40, 60, 80, 100, 120
+#define AUDIO_OPUS_BITRATE    16000// bit rate from 2400 to 512000
 #define AUDIO_OPUS_COMPLEXITY 0    // from 0 to 10
 #define OPUS_FRAME_SIZE ((SAMPLE_RATE / 1000) * AUDIO_OPUS_FRAME_MS)
-
-#define IDENTIFIER 2120
-
-#define TASK_STACK_SIZE 16384
-
-#define OUT_TO_IN_BUFF_FACTOR 5 //How much bigger the i2s_write buffer is relative to i2s_in
 
 #define BUFFER_SIZE 960
 
@@ -54,28 +47,25 @@
 #define LoRa_BUSY 13
 
 #define LoRa_BANDWIDTH 500.0F
-#define LoRa_CODING_RATE_DENOM 8 //5 may be better
-#define LoRa_FREQUENCY 920.0F
-#define LoRa_POWER 22 //was 17
+#define LoRa_CODING_RATE_DENOM 5
+#define LoRa_FREQUENCY 915.0F
+#define LoRa_POWER 22
 #define LoRa_PREAMBLE_LEN 10U
 #define LoRa_SPREADFACTOR 5
 #define LoRa_SYNCWORD 0xF5
 #define LoRa_TCXO_VOLTAGE 1.6
 #define LoRa_USE_REGULATOR_LDO false
 
-#define GAIN_FACTOR 25
-#define WINDOW_SIZE 5
+#define GAIN_FACTOR 45
 
+/* GCM Encryption Sizes */
 #define TAG_SIZE 16
 #define IV_SIZE 12
-#define CIPHER_SIZE 200
+#define CIPHER_SIZE 120
 
-//SX1262 radio = new Module(LoRa_NSS, LoRa_DIO1, LoRa_NRST, LoRa_BUSY);
+Module *lora_module;
 
-Module *lora_module; //= new Module(LoRa_NSS, LoRa_DIO1, LoRa_NRST, LoRa_BUSY);
-
-// Then pass it to SX1262
-SX1262 *radio; //(lora_module);
+SX1262 *radio;
 
 OpusEncoder *opus_encoder_;
 OpusDecoder *opus_decoder_;
@@ -87,21 +77,20 @@ bool deleteSpeak = false;
 bool deleteReceive = false;
 
 
-
+/* Function Declarations */
 void onSpeak();
 void onReceive();
 void normalize(int16_t*, size_t);
 void setFlag();
 void encrypt(uint8_t*, uint8_t*, uint8_t*, size_t);
 void decrypt();
-//TaskFunction_t speak;
 
+/* Set up I2S Processor configuration */
 void i2s_install() {
-  // Set up I2S Processor configuration
   const i2s_config_t i2s_config_in = {
     .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = i2s_bits_per_sample_t(16),//16
+    .bits_per_sample = i2s_bits_per_sample_t(16),
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
     .intr_alloc_flags = 0,
@@ -112,12 +101,12 @@ void i2s_install() {
 
   const i2s_config_t i2s_config_out = {
     .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_TX),  // I2S Master mode and Transmit (TX)
-    .sample_rate = SAMPLE_RATE,             // Set sample rate (16kHz)
+    .sample_rate = SAMPLE_RATE,             // Set sample rate
     .bits_per_sample = i2s_bits_per_sample_t(16),     // Set audio bit depth (16-bit)
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // Stereo output (Left and Right channels)
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // Stereo output
     .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),  // I2S communication format
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,   // Interrupt level (default)
-    .dma_buf_count = 16, //10
+    .dma_buf_count = 16,
     .dma_buf_len = BUFFER_SIZE,
     .use_apll = false
   };
@@ -148,52 +137,46 @@ void i2s_setpin() {
   };
 
   i2s_set_pin(I2S_PORT_IN, &in_pin_config);
-
   i2s_set_pin(I2S_PORT_OUT, &out_pin_config);
   i2s_zero_dma_buffer(I2S_PORT_OUT);
   
 }
 
+/* Compression Buffers */
 int16_t *new_opus;
 uint8_t *compressed;
-uint8_t *dataIn;
 int16_t *uncompressed;
 
+/* Encryption Buffers */
 uint8_t *encrypted;
 uint8_t *decrypted;
 uint8_t *nonce;
 
+/* Packet Buffers */
 uint8_t *sendPacket;
 uint8_t *receivePacket;
 
 
-SemaphoreHandle_t speakSemaphore;
-SemaphoreHandle_t receiveSemaphore;
 bool isReceiving = false;
 bool isSpeaking = false;
 
 volatile bool receivedFlag = false;
 uint16_t last_received = millis();
 
-
-//AES256 aes;               // AES cipher block using 256-bit key
-GCM<AES256> gcm;          // GCM wrapper around AES256
+GCM<AES256> gcm;  
 
 uint8_t key[16] = {182, 32, 42, 2, 243, 40, 201, 140, 141, 29, 199, 216, 117, 42, 43, 167};
-                   //194, 231, 2, 49, 48, 201, 231, 122, 21, 245, 114, 142, 11, 132, 200, 16};  // 256-bit (32-byte) pre-shared group key
-//uint8_t tag[16] = {182, 32, 42, 2, 243, 40, 201, 140, 141, 29, 199, 216, 117, 42, 43, 167};
-
 uint8_t tag[16];
-//BluetoothA2DPSink a2dp_sink;
+
  
 void setup() {
  
   /* Set up Serial Monitor */
   Serial.begin(115200);
-  //while(!Serial);
   delay(3000);
 
   Serial.println("Serial ready");
+
   /* Set the speak button */
   pinMode(SPEAK_BUTTON, INPUT_PULLUP);
 
@@ -227,23 +210,22 @@ void setup() {
               LoRa_USE_REGULATOR_LDO);
 
 
-              delay(100);
+  delay(100);
 
-              Serial.println("begin");
-              Serial.println(status);
+  Serial.println("begin");
+  Serial.println(status);
 
-              //radio.setDio1Action(setFlag);
-              status = radio->startReceive();
-              radio->setPacketReceivedAction(setFlag);
-              Serial.println("Status");
-              Serial.println(status);
+            
+  status = radio->startReceive();
+  radio->setPacketReceivedAction(setFlag);
+  Serial.println("Status");
+  Serial.println(status);
               
   if (radio->setCRC(true) == RADIOLIB_ERR_NONE) {
     Serial.println("CRC enabled successfully!");
   } else {
     Serial.println("Failed to enable CRC!");
   }
-  //delay(100);
 
   /* Create Encoder */
   int encoder_error;
@@ -262,7 +244,6 @@ void setup() {
   opus_encoder_ctl(opus_encoder_, OPUS_SET_BITRATE(AUDIO_OPUS_BITRATE));
   opus_encoder_ctl(opus_encoder_, OPUS_SET_COMPLEXITY(AUDIO_OPUS_COMPLEXITY));
   opus_encoder_ctl(opus_encoder_, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
-  //opus_encoder_ctl(opus_encoder_, OPUS_SET_BANDWIDTH(OPUS_BANDWIDTH_WIDEBAND));
   opus_encoder_ctl(opus_encoder_, OPUS_SET_GAIN(0)); 
   opus_encoder_ctl(opus_encoder_, OPUS_SET_VBR(0));
 
@@ -275,19 +256,17 @@ void setup() {
     return;
   } 
 
-  new_opus = (int16_t*) malloc(OPUS_FRAME_SIZE * sizeof(int16_t));// WAS *2!!!!!!!!!!
+  /* Allocate Buffers */
+  new_opus = (int16_t*) malloc(OPUS_FRAME_SIZE * sizeof(int16_t) * 3);
   assert(new_opus != NULL);
 
-  compressed = (uint8_t*) malloc(1275 * sizeof(uint8_t));
+  compressed = (uint8_t*) malloc(1275 * sizeof(uint8_t) * 3);
   assert(compressed != NULL);
 
-  dataIn = (uint8_t*) malloc(1275 * sizeof(uint8_t));
-  assert(dataIn != NULL);
-
-  encrypted = (uint8_t*) malloc(1275 * sizeof(uint8_t));
+  encrypted = (uint8_t*) malloc(1275 * sizeof(uint8_t) * 3);
   assert(encrypted != NULL);
 
-  decrypted = (uint8_t*) malloc(1275 * sizeof(uint8_t));
+  decrypted = (uint8_t*) malloc(1275 * sizeof(uint8_t) * 3);
 
   nonce = (uint8_t*) malloc(IV_SIZE);
   assert(nonce != NULL);
@@ -298,18 +277,10 @@ void setup() {
   receivePacket = (uint8_t*) malloc(IV_SIZE + CIPHER_SIZE + TAG_SIZE);
   assert(receivePacket != NULL);
 
-  uncompressed = (int16_t*) malloc(OPUS_FRAME_SIZE * sizeof(int16_t)); //WAS * 2!!!!!!!!!!!!!!
+  uncompressed = (int16_t*) malloc(OPUS_FRAME_SIZE * sizeof(int16_t) * 3); //WAS * 2!!!!!!!!!!!!!!
   assert(uncompressed != NULL);
 
-  speakSemaphore = xSemaphoreCreateBinary();
-  xSemaphoreGive(speakSemaphore);
-
-  receiveSemaphore = xSemaphoreCreateBinary();
-  xSemaphoreGive(receiveSemaphore);
-
-  //aes.setKey(key, sizeof(key)); // Load the key into the AES cipher
-  gcm.setKey(key, sizeof(key));              // Tell GCM to use this AES engine
-  //gcm.computeTag(tag, sizeof(tag));
+  gcm.setKey(key, sizeof(key));
 
   Serial.print("SETUP COMPLETE\n");
   delay(100);
@@ -318,24 +289,21 @@ void setup() {
 void loop() {
 
   if (deleteSpeak && speakTaskHandle != NULL) {
-    //assert(speakTaskHandle != NULL);
     while(eTaskGetState(speakTaskHandle) == eBlocked);
     vTaskDelete(speakTaskHandle);
     speakTaskHandle = NULL;
     deleteSpeak = false;
   }
   if (deleteReceive && receiveTaskHandle != NULL) {
-    //assert(receiveTaskHandle != NULL);
     radio->standby();
     while(eTaskGetState(receiveTaskHandle) == eBlocked);
     vTaskDelete(receiveTaskHandle);
     receiveTaskHandle = NULL;
     radio->startReceive();
     deleteReceive = false;
-    Serial.println("DELETED");
   }
+
   if (isSpeaking == false && digitalRead(SPEAK_BUTTON) == LOW && isReceiving == false) {
-      //Serial.println("1");
       isSpeaking = true;
       Serial.println("Start speak");
 
@@ -344,26 +312,22 @@ void loop() {
           radio->standby();
           while (digitalRead(SPEAK_BUTTON) == LOW) {
             onSpeak();
- 
           }
           radio->startReceive();
           receivedFlag = false;
           Serial.println("Terminating Speak");
           deleteSpeak = true;
           isSpeaking = false;
-          while(1);
+          while(1);  //freeRTOS tasks should never return, so it busy waits until it is deleted by loop()
         },
         "speakTask",     // name
-        8192 * 8,            // stack size in bytes
+        8192 * 8,        // stack size in bytes
         NULL,            // param
         1,               // priority
-        &speakTaskHandle,            // handle
+        &speakTaskHandle,// handle
         APP_CPU_NUM      // core
       ); 
   }
-
-  //Will not work, must be interrupt driven instead (see last chat)
-  //check if packet is available (doesn't actually read yet)
  
   if (receivedFlag == true && isSpeaking == false && isReceiving == false) {
 
@@ -390,21 +354,16 @@ void loop() {
           Serial.println("Terminating Receive");
           deleteReceive = true;
           i2s_zero_dma_buffer(I2S_PORT_OUT);
-          //yield();
           while(1);
         },
-        "receiveTask",     // name
-        8192 * 8,            // stack size in bytes
-        NULL,            // param
-        1,               // priority
-        &receiveTaskHandle,            // handle
-        1      // core
+        "receiveTask",      // name
+        8192 * 8,           // stack size in bytes
+        NULL,               // param
+        1,                  // priority
+        &receiveTaskHandle, // handle
+        1                   // core
       );
-      //Serial.println("CODE = ");
-      //Serial.println(code);
-
   }
-  
 }
 
 void onReceive() {
@@ -414,6 +373,7 @@ void onReceive() {
     Serial.println("Bad packet size");
     return;
   }
+
   int status = radio->readData(receivePacket, length);
   if (status == RADIOLIB_ERR_NONE) {
 
@@ -436,16 +396,16 @@ void onReceive() {
     if (!isAuthentic) {
       Serial.println("Inauthentic Data");
       return;
-      // Use the decrypted data
     }
     
-    //Serial.println(heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
-    int decoded_size = opus_decode(opus_decoder_, decrypted, CIPHER_SIZE, uncompressed, OPUS_FRAME_SIZE, 0);
-    //Serial.println(heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+    int decoded_size1 = opus_decode(opus_decoder_, decrypted, CIPHER_SIZE / 3, uncompressed, OPUS_FRAME_SIZE, 0);
+    int decoded_size2 = opus_decode(opus_decoder_, &decrypted[CIPHER_SIZE / 3], CIPHER_SIZE / 3, &uncompressed[decoded_size1], OPUS_FRAME_SIZE, 0);
+    int decoded_size3 = opus_decode(opus_decoder_, &decrypted[(CIPHER_SIZE / 3) * 2], CIPHER_SIZE / 3, &uncompressed[decoded_size1 + decoded_size2], OPUS_FRAME_SIZE, 0);
+    int decoded_size = decoded_size1 + decoded_size2 + decoded_size3;
 
-    
-  
     size_t num_out;
+
+    /* Apply Gain */
     for (int i = 0; i < decoded_size; i++) {
       int32_t amplified = uncompressed[i] * GAIN_FACTOR;
       if (amplified > 32767) amplified = 32767;
@@ -454,27 +414,26 @@ void onReceive() {
     }
 
     i2s_zero_dma_buffer(I2S_PORT_OUT);
-    status = i2s_write(I2S_PORT_OUT, uncompressed, OPUS_FRAME_SIZE * sizeof(int16_t), &num_out, 0);
-    //Serial.println(status);
+    status = i2s_write(I2S_PORT_OUT, uncompressed, OPUS_FRAME_SIZE * sizeof(int16_t) * 3, &num_out, 0);
   }
   else {
     Serial.println("Error = " + status);
   }
-
 }
 
 
 void onSpeak() {
 
-
   size_t num_in;
 
-  esp_err_t err = i2s_read(I2S_PORT_IN, new_opus, OPUS_FRAME_SIZE * sizeof(int16_t), &num_in, portMAX_DELAY);
-  size_t len = opus_encode(opus_encoder_, new_opus, OPUS_FRAME_SIZE, compressed, 1275 * sizeof(uint8_t));
-  //Serial.println(len);
+  esp_err_t err = i2s_read(I2S_PORT_IN, new_opus, OPUS_FRAME_SIZE * sizeof(int16_t) * 3, &num_in, portMAX_DELAY);
+
+  size_t len1 = opus_encode(opus_encoder_, &new_opus[0], OPUS_FRAME_SIZE, compressed, 1275 * sizeof(uint8_t));
+  size_t len2 = opus_encode(opus_encoder_, &new_opus[OPUS_FRAME_SIZE], OPUS_FRAME_SIZE, &compressed[len1], 1275 * sizeof(uint8_t));
+  size_t len3 = opus_encode(opus_encoder_, &new_opus[OPUS_FRAME_SIZE * 2], OPUS_FRAME_SIZE, &compressed[len1 + len2], 1275 * sizeof(uint8_t));
+  size_t len = len1 + len2 + len3;
 
   encrypt(encrypted, compressed, nonce, len);
-  //Serial.println(len);
 
   for (int i = 0; i < IV_SIZE; i++) {
     sendPacket[i] = nonce[i];
@@ -486,9 +445,7 @@ void onSpeak() {
     sendPacket[i] = tag[i - (IV_SIZE + CIPHER_SIZE)];
   }
 
-  int test = radio->transmit(sendPacket, IV_SIZE + CIPHER_SIZE + TAG_SIZE);
-
-
+  int ret = radio->transmit(sendPacket, IV_SIZE + CIPHER_SIZE + TAG_SIZE);
 }
 
 void encrypt(uint8_t *ciphertext, uint8_t *plaintext, uint8_t *nonce, size_t len) {
